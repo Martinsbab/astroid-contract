@@ -777,6 +777,337 @@ fn allowance_remove_restores_unlimited() {
         .is_ok());
 }
 
+// ---------------------------------------------------------------------------
+// Deterministic error-code validation (Issue #252)
+//
+// The numeric code a failed call decodes to is a public ABI: the API, SDK and
+// dashboard switch on it. These tests pin the exact `Error` variant — and its
+// numeric value — returned by every policy failure path, and prove that
+// out-of-bounds rule evaluation fails deterministically instead of panicking
+// or running unchecked arithmetic.
+// ---------------------------------------------------------------------------
+
+/// Pin the numeric values of every code this contract can return. A
+/// renumbering (or a return value drifting from the enum) is a breaking ABI
+/// change, so it must fail the suite rather than slip through unnoticed.
+#[test]
+fn policy_error_codes_are_pinned_to_their_numeric_values() {
+    assert_eq!(Error::NotFound as u32, 1);
+    assert_eq!(Error::AlreadyExists as u32, 2);
+    assert_eq!(Error::Unauthorized as u32, 3);
+    assert_eq!(Error::InvalidInput as u32, 4);
+    assert_eq!(Error::InvalidAmount as u32, 12);
+    assert_eq!(Error::PolicyDenied as u32, 20);
+    assert_eq!(Error::PolicyRecipientRestricted as u32, 22);
+    assert_eq!(Error::PolicyMerchantBlocked as u32, 23);
+    assert_eq!(Error::PolicyCategoryRestricted as u32, 24);
+    assert_eq!(Error::PolicyAllowanceExceeded as u32, 26);
+    assert_eq!(Error::AssetNotAuthorized as u32, 43);
+}
+
+/// The scalar spending ceiling is inclusive at exactly `max_amount` and
+/// denied one base unit above it — always with the exact `PolicyDenied` code,
+/// even at the top of the `i128` range (no overflow, no panic).
+#[test]
+fn spending_ceiling_boundary_returns_exact_policy_denied() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    // `setup` registers `max_txn` with `max_amount = 1_000_000`.
+    let p = setup(&env, &owner);
+    let asset = Address::generate(&env);
+    let recip = Address::generate(&env);
+    let policy_id = String::from_str(&env, "max_txn");
+
+    assert_eq!(
+        p.try_check_transfer(&policy_id, &asset, &recip, &1_000_000),
+        Ok(Ok(()))
+    );
+    assert_eq!(
+        p.try_check_transfer(&policy_id, &asset, &recip, &1_000_001),
+        Err(Ok(Error::PolicyDenied))
+    );
+    // The largest representable amount is denied deterministically too.
+    assert_eq!(
+        p.try_check_transfer(&policy_id, &asset, &recip, &i128::MAX),
+        Err(Ok(Error::PolicyDenied))
+    );
+}
+
+/// A disabled policy denies every spend with exactly `PolicyDenied` and
+/// re-enabling restores the original verdict.
+#[test]
+fn disabled_policy_denies_with_exact_policy_denied() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = setup(&env, &owner);
+    let asset = Address::generate(&env);
+    let recip = Address::generate(&env);
+    let policy_id = String::from_str(&env, "max_txn");
+
+    p.set_enabled(&owner, &policy_id, &false);
+    assert_eq!(
+        p.try_check_transfer(&policy_id, &asset, &recip, &1),
+        Err(Ok(Error::PolicyDenied))
+    );
+    p.set_enabled(&owner, &policy_id, &true);
+    assert_eq!(
+        p.try_check_transfer(&policy_id, &asset, &recip, &1),
+        Ok(Ok(()))
+    );
+}
+
+/// The scalar recipient and asset allow-lists both deny with exactly
+/// `PolicyDenied`, and the matching pair still passes.
+#[test]
+fn scalar_allowlist_gates_return_exact_policy_denied() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let allowed_recip = Address::generate(&env);
+    let allowed_asset = Address::generate(&env);
+    let id = env.register_contract(None, PolicyContract);
+    let p = PolicyContractClient::new(&env, &id);
+    p.initialize();
+    let policy_id = String::from_str(&env, "lim");
+    p.register_policy(
+        &owner,
+        &policy_id,
+        &BytesN::from_array(&env, &[3; 32]),
+        &0,
+        &Some(allowed_recip.clone()),
+        &Some(allowed_asset.clone()),
+        &0,
+    );
+
+    // Unknown recipient is rejected before any asset evaluation.
+    assert_eq!(
+        p.try_check_transfer(&policy_id, &allowed_asset, &Address::generate(&env), &1,),
+        Err(Ok(Error::PolicyDenied))
+    );
+    // Known recipient with a different asset is rejected next.
+    assert_eq!(
+        p.try_check_transfer(&policy_id, &Address::generate(&env), &allowed_recip, &1,),
+        Err(Ok(Error::PolicyDenied))
+    );
+    // The exact (recipient, asset) pair passes.
+    assert_eq!(
+        p.try_check_transfer(&policy_id, &allowed_asset, &allowed_recip, &1),
+        Ok(Ok(()))
+    );
+}
+
+/// Each blocklist gate reports its own dedicated deterministic code — never a
+/// generic failure — so off-chain monitors can tell the violation kinds apart.
+#[test]
+fn blocklist_gates_return_their_dedicated_codes() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = setup(&env, &owner);
+    let asset = Address::generate(&env);
+    let policy_id = String::from_str(&env, "max_txn");
+
+    let blocked = Address::generate(&env);
+    p.add_to_blocklist(&owner, &policy_id, &blocked);
+    assert_eq!(
+        p.try_check_transfer(&policy_id, &asset, &blocked, &1),
+        Err(Ok(Error::PolicyRecipientRestricted))
+    );
+
+    let merchant = Address::generate(&env);
+    p.add_merchant_blacklist(&owner, &policy_id, &merchant);
+    assert_eq!(
+        p.try_check_transfer(&policy_id, &asset, &merchant, &1),
+        Err(Ok(Error::PolicyMerchantBlocked))
+    );
+
+    p.add_category_blacklist(&owner, &policy_id, &String::from_str(&env, "gambling"));
+    assert_eq!(
+        p.try_check_category(&policy_id, &String::from_str(&env, "gambling")),
+        Err(Ok(Error::PolicyCategoryRestricted))
+    );
+    // An unlisted category stays allowed.
+    assert_eq!(
+        p.try_check_category(&policy_id, &String::from_str(&env, "groceries")),
+        Ok(Ok(()))
+    );
+}
+
+/// With the per-policy asset whitelist enabled, an asset that was never
+/// added fails with exactly `AssetNotAuthorized`; whitelisting it restores
+/// the transfer.
+#[test]
+fn asset_whitelist_violation_returns_exact_asset_not_authorized() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = setup(&env, &owner);
+    let listed = Address::generate(&env);
+    let unlisted = Address::generate(&env);
+    let recip = Address::generate(&env);
+    let policy_id = String::from_str(&env, "max_txn");
+
+    p.set_asset_whitelist_enabled(&owner, &policy_id, &true);
+    assert_eq!(
+        p.try_check_transfer(&policy_id, &unlisted, &recip, &1),
+        Err(Ok(Error::AssetNotAuthorized))
+    );
+
+    p.add_asset_to_whitelist(&owner, &policy_id, &listed);
+    assert_eq!(
+        p.try_check_transfer(&policy_id, &listed, &recip, &1),
+        Ok(Ok(()))
+    );
+}
+
+/// A policy with `expires_at` is active in the ledger block before the
+/// boundary and denied — with the exact code — from the boundary timestamp
+/// onward: the active window is half-open `[0, expires_at)`, evaluated per
+/// block against the ledger clock.
+#[test]
+fn policy_expiry_is_half_open_and_evaluated_per_ledger_block() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let id = env.register_contract(None, PolicyContract);
+    let p = PolicyContractClient::new(&env, &id);
+    p.initialize();
+    let policy_id = String::from_str(&env, "exp");
+    p.register_policy(
+        &owner,
+        &policy_id,
+        &BytesN::from_array(&env, &[5; 32]),
+        &0,
+        &None,
+        &None,
+        &1_000,
+    );
+    let asset = Address::generate(&env);
+    let recip = Address::generate(&env);
+
+    env.ledger().set_sequence_number(7);
+    env.ledger().set_timestamp(999);
+    assert_eq!(
+        p.try_check_transfer(&policy_id, &asset, &recip, &1),
+        Ok(Ok(()))
+    );
+
+    // Next block lands exactly on the expiry instant: denied from here on.
+    env.ledger().set_sequence_number(8);
+    env.ledger().set_timestamp(1_000);
+    assert_eq!(
+        p.try_check_transfer(&policy_id, &asset, &recip, &1),
+        Err(Ok(Error::PolicyDenied))
+    );
+}
+
+/// Cumulative allowance exhaustion: spends up to exactly the limit are
+/// accepted, one base unit more is refused with `PolicyAllowanceExceeded`,
+/// and a refused attempt leaves `spent` untouched (transactional behaviour).
+#[test]
+fn allowance_exhaustion_is_exact_and_failed_attempts_leave_spent_unchanged() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = allowance_setup(&env, &owner);
+    let asset = Address::generate(&env);
+    let recip = Address::generate(&env);
+    let policy_id = String::from_str(&env, "mt");
+
+    p.set_allowance(&owner, &policy_id, &asset, &100, &0);
+    assert!(p
+        .try_update_allowance(&owner, &policy_id, &asset, &60)
+        .is_ok());
+    assert!(p
+        .try_update_allowance(&owner, &policy_id, &asset, &40)
+        .is_ok());
+    assert_eq!(p.get_allowance(&policy_id, &asset).spent, 100);
+
+    // One unit past the exhausted ceiling — both the view and the mutating
+    // path report the exact code, and neither writes state.
+    assert_eq!(
+        p.try_check_allowance(&policy_id, &asset, &1),
+        Err(Ok(Error::PolicyAllowanceExceeded))
+    );
+    assert_eq!(
+        p.try_update_allowance(&owner, &policy_id, &asset, &1),
+        Err(Ok(Error::PolicyAllowanceExceeded))
+    );
+    assert_eq!(
+        p.try_check_transfer(&policy_id, &asset, &recip, &1),
+        Err(Ok(Error::PolicyAllowanceExceeded))
+    );
+    assert_eq!(p.get_allowance(&policy_id, &asset).spent, 100);
+
+    // A zero-amount probe against an exhausted allowance is still in bounds.
+    assert_eq!(p.try_check_allowance(&policy_id, &asset, &0), Ok(Ok(0)));
+    // Negative amounts are malformed input, not ceiling violations.
+    assert_eq!(
+        p.try_check_allowance(&policy_id, &asset, &-1),
+        Err(Ok(Error::InvalidAmount))
+    );
+    assert_eq!(
+        p.try_update_allowance(&owner, &policy_id, &asset, &-1),
+        Err(Ok(Error::InvalidAmount))
+    );
+}
+
+/// Out-of-bounds child indices in a composite rule must surface the
+/// deterministic `InvalidInput` during evaluation — never a panic or
+/// unchecked arithmetic — and an inverted child range fails closed instead of
+/// silently passing the branch.
+#[test]
+fn out_of_bounds_composite_children_fail_deterministically() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = Address::generate(&env);
+    let p = composite_setup(&env, &owner);
+    let asset = Address::generate(&env);
+    let recip = Address::generate(&env);
+    let policy_id = String::from_str(&env, "cr");
+
+    let branch = |children_start: u32, children_end: u32| {
+        let mut tree = RuleTree::new(&env);
+        tree.push_back(RuleNode {
+            op: RuleOp::And,
+            value_i128: 0,
+            value_address: Address::generate(&env),
+            children_start,
+            children_end,
+        });
+        tree
+    };
+
+    // Child range entirely beyond the tree: evaluation reports InvalidInput.
+    p.set_composite_rule(&owner, &policy_id, &branch(5, 6));
+    assert_eq!(
+        p.try_check_transfer(&policy_id, &asset, &recip, &1),
+        Err(Ok(Error::InvalidInput))
+    );
+
+    // Inverted range (start > end): fails closed rather than passing silently.
+    p.set_composite_rule(&owner, &policy_id, &branch(3, 2));
+    assert_eq!(
+        p.try_check_transfer(&policy_id, &asset, &recip, &1),
+        Err(Ok(Error::InvalidInput))
+    );
+
+    // The direct view reports the same deterministic code.
+    assert_eq!(
+        p.try_evaluate_composite_rule(
+            &policy_id,
+            &TransactionPayload {
+                asset,
+                recipient: recip,
+                amount: 1,
+            },
+        ),
+        Err(Ok(Error::InvalidInput))
+    );
+}
+
 // --- Composite rule tests ---
 
 fn composite_setup<'a>(env: &'a Env, owner: &Address) -> PolicyContractClient<'a> {

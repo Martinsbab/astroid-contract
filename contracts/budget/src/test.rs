@@ -1657,3 +1657,234 @@ fn release_reports_the_same_remaining_as_the_view() {
     // limit 1_000 - deficit 500 - spent 100
     assert_eq!(after_release, 400);
 }
+
+// ---------------------------------------------------------------------------
+// Deterministic error-code validation (Issue #252)
+//
+// Budget failure paths must decode to the exact shared `Error` variant — and
+// its numeric value — so off-chain consumers can switch on them safely. These
+// tests pin the code table, prove cumulative-spend exhaustion is enforced
+// exactly at the limit, and show that every refused spend leaves storage
+// untouched across ledger blocks.
+// ---------------------------------------------------------------------------
+
+/// Pin the numeric values of every code this contract can return. A
+/// renumbering (or a return value drifting from the enum) is a breaking ABI
+/// change, so it must fail the suite rather than slip through unnoticed.
+#[test]
+fn budget_error_codes_are_pinned_to_their_numeric_values() {
+    assert_eq!(Error::NotFound as u32, 1);
+    assert_eq!(Error::Unauthorized as u32, 3);
+    assert_eq!(Error::InvalidInput as u32, 4);
+    assert_eq!(Error::Overflow as u32, 11);
+    assert_eq!(Error::InvalidAmount as u32, 12);
+    assert_eq!(Error::BudgetExceeded as u32, 40);
+    assert_eq!(Error::BudgetFrozen as u32, 41);
+    assert_eq!(Error::BudgetArchived as u32, 42);
+    assert_eq!(Error::AssetNotAuthorized as u32, 43);
+    assert_eq!(Error::BudgetExpired as u32, 44);
+}
+
+/// Cumulative expenditure is enforced exactly at the limit: the spend that
+/// lands on the ceiling succeeds with zero remaining, one base unit more is
+/// refused with `BudgetExceeded`, and every refused attempt leaves `spent`
+/// (and therefore `remaining`) exactly where it was.
+#[test]
+fn cumulative_spend_exhaustion_is_exact_and_leaves_state_intact() {
+    let h = setup();
+    h.client.allocate(
+        &h.owner,
+        &id(&h.env, "eng"),
+        &1_000,
+        &Period::None,
+        &false,
+        &0,
+    );
+
+    assert_eq!(h.client.consume(&h.owner, &id(&h.env, "eng"), &600), 400);
+
+    // 401 would overshoot the remaining headroom by one unit.
+    assert_eq!(
+        h.client.try_consume(&h.owner, &id(&h.env, "eng"), &401),
+        Err(Ok(Error::BudgetExceeded))
+    );
+    // The refused attempt did not move cumulative expenditure.
+    assert_eq!(h.client.get(&id(&h.env, "eng")).spent, 600);
+    assert_eq!(h.client.remaining(&id(&h.env, "eng")), 400);
+
+    // Landing exactly on the ceiling is allowed and reports zero remaining.
+    assert_eq!(h.client.consume(&h.owner, &id(&h.env, "eng"), &400), 0);
+    assert_eq!(h.client.remaining(&id(&h.env, "eng")), 0);
+    assert_eq!(h.client.get(&id(&h.env, "eng")).spent, 1_000);
+
+    // One unit past an exhausted budget is still `BudgetExceeded`, not a
+    // generic failure — and cumulative expenditure stays at exactly the limit.
+    assert_eq!(
+        h.client.try_consume(&h.owner, &id(&h.env, "eng"), &1),
+        Err(Ok(Error::BudgetExceeded))
+    );
+    assert_eq!(h.client.get(&id(&h.env, "eng")).spent, 1_000);
+    assert_eq!(h.client.remaining(&id(&h.env, "eng")), 0);
+}
+
+/// A spend that fails authorization (or hits a lifecycle gate) must leave
+/// cumulative expenditure untouched: the deterministic code is returned and
+/// no partial debit is recorded.
+#[test]
+fn failed_spend_authorization_leaves_expenditure_unchanged() {
+    let h = setup();
+    h.client.allocate(
+        &h.owner,
+        &id(&h.env, "eng"),
+        &1_000,
+        &Period::None,
+        &false,
+        &0,
+    );
+
+    // A stranger is refused before any accounting happens.
+    let stranger = Address::generate(&h.env);
+    assert_eq!(
+        h.client.try_consume(&stranger, &id(&h.env, "eng"), &100),
+        Err(Ok(Error::Unauthorized))
+    );
+    assert_eq!(h.client.get(&id(&h.env, "eng")).spent, 0);
+
+    // A frozen budget reports its own code and records nothing either.
+    h.client.freeze(&h.owner, &id(&h.env, "eng"));
+    assert_eq!(
+        h.client.try_consume(&h.owner, &id(&h.env, "eng"), &100),
+        Err(Ok(Error::BudgetFrozen))
+    );
+    assert_eq!(h.client.get(&id(&h.env, "eng")).spent, 0);
+    assert_eq!(h.client.remaining(&id(&h.env, "eng")), 1_000);
+
+    // Once unfrozen the same spend goes through normally.
+    h.client.unfreeze(&h.owner, &id(&h.env, "eng"));
+    assert_eq!(h.client.consume(&h.owner, &id(&h.env, "eng"), &100), 900);
+}
+
+/// Cumulative expenditure is scoped to the budget period: exhausting the
+/// envelope in one block denies the next spend with `BudgetExceeded`, and the
+/// window boundary (evaluated across ledger blocks) restores exactly one
+/// period's allowance for the next window.
+#[test]
+fn expenditure_resets_per_period_across_ledger_blocks() {
+    let h = setup();
+    h.client.allocate(
+        &h.owner,
+        &id(&h.env, "daily"),
+        &500,
+        &Period::Daily,
+        &false,
+        &0,
+    );
+    h.env.ledger().set_sequence_number(1);
+
+    // First block: spend the whole envelope, then get refused one unit later.
+    assert_eq!(h.client.consume(&h.owner, &id(&h.env, "daily"), &500), 0);
+    assert_eq!(
+        h.client.try_consume(&h.owner, &id(&h.env, "daily"), &1),
+        Err(Ok(Error::BudgetExceeded))
+    );
+
+    // Next block lands exactly on the window end (half-open `[start, end)`):
+    // the period has rolled and the allowance is whole again.
+    h.env.ledger().set_sequence_number(2);
+    h.env.ledger().set_timestamp(1_000 + 86_400);
+    assert_eq!(h.client.remaining(&id(&h.env, "daily")), 500);
+    assert_eq!(h.client.consume(&h.owner, &id(&h.env, "daily"), &500), 0);
+    assert_eq!(
+        h.client.try_consume(&h.owner, &id(&h.env, "daily"), &1),
+        Err(Ok(Error::BudgetExceeded))
+    );
+    // The new period's cumulative spend is tracked on its own.
+    assert_eq!(h.client.get(&id(&h.env, "daily")).spent, 500);
+}
+
+/// Per-asset expenditure is tracked cumulatively in persistent storage and
+/// refuses the first unit past the per-token ceiling with the exact code,
+/// leaving the stored counter untouched on failure.
+#[test]
+fn per_asset_expenditure_tracks_cumulatively_and_rejects_over_limit() {
+    let h = setup();
+    h.client.allocate(
+        &h.owner,
+        &id(&h.env, "eng"),
+        &1_000,
+        &Period::None,
+        &false,
+        &0,
+    );
+    let token = Address::generate(&h.env);
+    h.client
+        .set_budget_limit(&h.owner, &id(&h.env, "eng"), &token, &500, &0);
+
+    assert!(h
+        .client
+        .try_check_and_record_spend(&h.owner, &id(&h.env, "eng"), &token, &300)
+        .is_ok());
+    assert!(h
+        .client
+        .try_check_and_record_spend(&h.owner, &id(&h.env, "eng"), &token, &200)
+        .is_ok());
+    assert_eq!(h.client.asset_remaining(&id(&h.env, "eng"), &token), 0);
+
+    assert_eq!(
+        h.client
+            .try_check_and_record_spend(&h.owner, &id(&h.env, "eng"), &token, &1,),
+        Err(Ok(Error::BudgetExceeded))
+    );
+    // The refused spend left the cumulative counter at exactly the ceiling.
+    assert_eq!(
+        h.client.get_asset_budget(&id(&h.env, "eng"), &token).spent,
+        500
+    );
+    // Negative amounts are malformed input, not ceiling violations.
+    assert_eq!(
+        h.client
+            .try_check_and_record_spend(&h.owner, &id(&h.env, "eng"), &token, &-1,),
+        Err(Ok(Error::InvalidAmount))
+    );
+    // A token that never had a per-asset limit is not authorized for spending.
+    let unknown = Address::generate(&h.env);
+    assert_eq!(
+        h.client
+            .try_check_and_record_spend(&h.owner, &id(&h.env, "eng"), &unknown, &1,),
+        Err(Ok(Error::AssetNotAuthorized))
+    );
+}
+
+/// Releasing more than has been spent in the period is refused with the
+/// exact `InvalidAmount` code and leaves cumulative expenditure unchanged.
+#[test]
+fn release_overdraw_returns_invalid_amount_and_keeps_state() {
+    let h = setup();
+    h.client.allocate(
+        &h.owner,
+        &id(&h.env, "eng"),
+        &1_000,
+        &Period::None,
+        &false,
+        &0,
+    );
+    h.client.consume(&h.owner, &id(&h.env, "eng"), &300);
+
+    assert_eq!(
+        h.client.try_release(&h.owner, &id(&h.env, "eng"), &301),
+        Err(Ok(Error::InvalidAmount))
+    );
+    assert_eq!(
+        h.client.try_release(&h.owner, &id(&h.env, "eng"), &0),
+        Err(Ok(Error::InvalidAmount))
+    );
+    assert_eq!(
+        h.client.try_release(&h.owner, &id(&h.env, "eng"), &-5),
+        Err(Ok(Error::InvalidAmount))
+    );
+    assert_eq!(h.client.get(&id(&h.env, "eng")).spent, 300);
+
+    // The exact spent amount is refundable and restores the headroom.
+    assert_eq!(h.client.release(&h.owner, &id(&h.env, "eng"), &300), 1_000);
+    assert_eq!(h.client.get(&id(&h.env, "eng")).spent, 0);
+}

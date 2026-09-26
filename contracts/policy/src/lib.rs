@@ -236,7 +236,10 @@ fn evaluate_node(
         RuleOp::RecipientBlacklisted => Ok(context.recipient_blacklisted(env, &payload.recipient)),
         RuleOp::MerchantBlacklisted => Ok(context.merchant_blacklisted(env, &payload.recipient)),
         RuleOp::And => {
-            if node.children_start == node.children_end {
+            // An empty *or inverted* child range is malformed and must fail
+            // closed with `InvalidInput` — an inverted range used to fall
+            // through the loop as a silent pass (Issue #252).
+            if node.children_start >= node.children_end {
                 return Err(Error::InvalidInput);
             }
             for i in node.children_start..node.children_end {
@@ -247,7 +250,9 @@ fn evaluate_node(
             Ok(true)
         }
         RuleOp::Or => {
-            if node.children_start == node.children_end {
+            // Same fail-closed rule as `And`: empty or inverted ranges are
+            // `InvalidInput`, never an implicit success (Issue #252).
+            if node.children_start >= node.children_end {
                 return Err(Error::InvalidInput);
             }
             for i in node.children_start..node.children_end {
